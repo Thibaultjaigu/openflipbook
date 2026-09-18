@@ -8,6 +8,7 @@ import type {
   WorldVec2,
 } from "@openflipbook/config";
 
+import { blockDistance, pointInBlock, solidBlocks, type LayoutBlock } from "./layout-control";
 import { cropEntities, projectScene } from "./world-geometry";
 
 /**
@@ -45,6 +46,8 @@ const SUBMAP_FRACTION = 0.4;
 // Fewer than this many entities in the window → not worth a submap (explainer).
 const MIN_SUBMAP_ENTITIES = 2;
 const EYE_HEIGHT = 1.7;
+// A footprint this low is something the camera can stand on, not inside.
+const STAND_IN_MAX = 5;
 const DEFAULT_FOV = Math.PI / 2;
 
 export function focusOnMap(
@@ -90,20 +93,92 @@ function focusInScene(
   return null;
 }
 
-/** Stand off `focus` in the direction of `from` (the current viewer), looking
- *  back at it; tilt up for things much taller than eye level. */
-function observerFacing(focus: WorldEntityGeo, from: WorldVec2): ObserverPose {
+/** Does the segment a->b cross this block's footprint (with a margin)?
+ *  Exact, in the block's own frame: sampling the line missed thin walls. */
+function segmentHitsBlock(b: LayoutBlock, a: WorldVec2, c: WorldVec2, margin = 0): boolean {
+  const h = b.heading ?? 0;
+  const cos = Math.cos(h), sin = Math.sin(h);
+  const to = (p: WorldVec2) => {
+    const dx = p.x - b.pos.x, dy = p.y - b.pos.y;
+    return { x: dx * cos + dy * sin, y: -dx * sin + dy * cos };
+  };
+  const p0 = to(a), p1 = to(c);
+  const hw = b.footprint.w / 2 + margin, hd = b.footprint.d / 2 + margin;
+  let t0 = 0, t1 = 1;
+  for (const [o, d, lo, hi] of [[p0.x, p1.x - p0.x, -hw, hw], [p0.y, p1.y - p0.y, -hd, hd]] as const) {
+    if (Math.abs(d) < 1e-12) {
+      if (o < lo || o > hi) return false;
+      continue;
+    }
+    const ta = (lo - o) / d, tb = (hi - o) / d;
+    t0 = Math.max(t0, Math.min(ta, tb));
+    t1 = Math.min(t1, Math.max(ta, tb));
+    if (t0 > t1) return false;
+  }
+  return true;
+}
+
+/** Stand off `focus` toward `from` (the current viewer), looking back at it;
+ *  tilt up for things much taller than eye level. The standoff frames the
+ *  place in the 90° view. When `obstacles` are known, step closer (then rotate
+ *  the bearing in 30° steps) until the camera stands in no building and none
+ *  blocks the view of the place. Lower footprints (a well, a market square)
+ *  are ground you can stand on, but they still hide what is behind them only
+ *  if they are tall enough to matter. */
+function observerFacing(
+  focus: WorldEntityGeo,
+  from: WorldVec2,
+  obstacles: readonly WorldEntityGeo[] = [],
+): ObserverPose {
   const dx = from.x - focus.pos.x;
   const dy = from.y - focus.pos.y;
-  const len = Math.hypot(dx, dy);
   // Degenerate (viewer sits on the focus) → default to standing south of it.
-  const [ux, uy] = len > 1e-6 ? [dx / len, dy / len] : [0, 1];
-  const standoff =
-    Math.max(focus.footprint.w, focus.footprint.d, focus.height) * 1.5 + 5;
-  const pos: WorldVec2 = {
-    x: focus.pos.x + ux * standoff,
-    y: focus.pos.y + uy * standoff,
+  const base = Math.hypot(dx, dy) > 1e-6 ? Math.atan2(dy, dx) : Math.PI / 2;
+  const size = Math.max(focus.footprint.w, focus.footprint.d);
+  const ideal = size / 2 + Math.max(size, focus.height) / 1.4 + 2;
+  const solids = solidBlocks(obstacles, focus.parent_id ?? null).filter((b) => b.id !== focus.id);
+  // ponytail: extraction cannot say which footprints are ground, so height
+  // stands in for it. Up to STAND_IN_MAX a footprint is something you stand ON
+  // (a plaza, a quay, the square around a well — the live enter camera belongs
+  // there); above it, you would be standing inside a building. Upgrade path: a
+  // solid/ground flag on geos, which would also fix the ground label rule.
+  const walls = solids.filter((b) => b.height > STAND_IN_MAX);
+  // Only a building about as tall as the place can hide it from view.
+  const tall = solids.filter((b) => b.height >= focus.height * 0.8);
+  const room = (pos: WorldVec2): number => {
+    if (pointInBlock(focus, pos, 2)) return -Infinity;
+    let worst = Infinity;
+    for (const b of walls) worst = Math.min(worst, blockDistance(b, pos) - 1);
+    for (const b of tall) if (segmentHitsBlock(b, pos, focus.pos)) return -Infinity;
+    return worst;
   };
+  const at = (bearing: number, distance: number): WorldVec2 => ({
+    x: focus.pos.x + Math.cos(bearing) * distance,
+    y: focus.pos.y + Math.sin(bearing) * distance,
+  });
+  let standoff = ideal;
+  let pos = at(base, ideal);
+  if (solids.length) {
+    // Take the first clear spot (they are tried nearest the asked-for bearing
+    // first); with none clear, take the most open one rather than a wall.
+    let bestScore = room(pos);
+    search: for (const step of [0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6]) {
+      for (const scale of [1, 0.8, 0.65]) {
+        const candidate = at(base + (step * Math.PI) / 6, ideal * scale);
+        const score = room(candidate);
+        if (score >= 0) {
+          standoff = ideal * scale;
+          pos = candidate;
+          break search;
+        }
+        if (score > bestScore) {
+          bestScore = score;
+          standoff = ideal * scale;
+          pos = candidate;
+        }
+      }
+    }
+  }
   const gaze = Math.atan2(focus.pos.y - pos.y, focus.pos.x - pos.x);
   const pitch =
     focus.height > EYE_HEIGHT * 3
@@ -169,11 +244,12 @@ export function entityCloseupCrop(
 export function routeToFocus(
   focus: WorldEntityGeo,
   from: WorldVec2,
+  obstacles: readonly WorldEntityGeo[] = [],
 ): Extract<ClickRoute, { kind: "scene" }> {
   return {
     kind: "scene",
     level: focus.height >= BUILDING_HEIGHT ? "building" : "street",
-    observer: observerFacing(focus, from),
+    observer: observerFacing(focus, from, obstacles),
     focus_id: focus.id,
   };
 }
@@ -222,7 +298,7 @@ export function routeClick(
       }
     }
     const from = view.observer?.pos ?? cropCentre(view.map_crop ?? map.bounds);
-    return routeToFocus(focus, from);
+    return routeToFocus(focus, from, entities);
   }
 
   // Empty map area that still holds a cluster → crop a submap around it.
