@@ -1,7 +1,7 @@
 import type { MapCrop, ObserverPose, WorldEntityGeo, WorldVec2 } from "@openflipbook/config";
 
-import { LANE_GAP, carveLanes } from "./lane-carve";
-import { blockDistance, solidBlocks, type LayoutBlock } from "./layout-control";
+import { carveLanes } from "./lane-carve";
+import { blockDistance, pointInBlock, solidBlocks, type LayoutBlock } from "./layout-control";
 
 // A route the user DRAWS on the map: the stroke becomes world positions, the
 // camera looks along it, and checkpoints mark where a new keyframe image is
@@ -9,6 +9,16 @@ import { blockDistance, solidBlocks, type LayoutBlock } from "./layout-control";
 
 export const EYE_HEIGHT = 1.7;
 export const DEFAULT_FOV = Math.PI / 2;
+
+/** How wide a lane the ROUTE needs, as opposed to a person.
+ *
+ *  `LANE_GAP` is a pedestrian gap -- room to squeeze between two walls. A
+ *  camera also needs standoff, or it is pressed against a seven-metre face and
+ *  sees only stone. Walking a live town at the pedestrian gap left every
+ *  camera a median 4 units from the line the user drew and the worst 8.5; at
+ *  this gap the median is 1.0 and the worst 4.5, so the walk follows the
+ *  stroke instead of scattering to whatever spots happened to be open. */
+export const ROUTE_LANE_GAP = 8;
 
 export interface RouteOptions {
   /** A turn this large since the last checkpoint forces a new one. */
@@ -189,7 +199,19 @@ export function routeFromStroke(
   // Extracted footprints overlap: on the live map every point inside the town
   // is inside a building, so a route could only ever hug the outside. Narrow
   // them about their centres first, and the town has lanes to walk.
-  const walls = carveLanes(solidBlocks(entities, options.frameParentId ?? null), options.laneGap ?? LANE_GAP);
+  // A quarter or district -- the container an ascend synthesizes -- is a frame
+  // OTHER places are nested inside, and it spans everything they span. Left
+  // solid it makes the whole map one building: a live route stepped all 53 of
+  // its cameras aside and looped outside the town it was drawn in. Both halves
+  // are needed: only a frame qualifies, so a hall drawn straight through still
+  // reports blocked, and only when the whole line is inside it, so a frame the
+  // route merely passes still has walls.
+  const frames = new Set(entities.map((e) => e.parent_id).filter((id): id is string => !!id));
+  const container = (b: LayoutBlock) => frames.has(b.id) && world.every((p) => pointInBlock(b, p));
+  const walls = carveLanes(
+    solidBlocks(entities, options.frameParentId ?? null).filter((b) => !container(b)),
+    options.laneGap ?? ROUTE_LANE_GAP,
+  );
   // Sample fine enough to see corners, whatever the distance limit is — but
   // the sideways walk costs samples x offsets squared, and a stroke across a
   // zoomed-out map is arbitrarily long in world units, so cap the count.
