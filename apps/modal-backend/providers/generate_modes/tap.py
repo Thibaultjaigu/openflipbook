@@ -858,10 +858,18 @@ async def stream_tap(
             region_bytes = render_loop.data_url_bytes(region_ref)
             if region_bytes is None:
                 return first
+            # score_step_in gives "the same place at the same framing" 5 and
+            # "closer" more. A MAP zoom's target is the tapped crop's own
+            # framing drawn in more detail, so a correct one tops out at 5:
+            # at the shared 6.0 floor no map zoom passed and every map tap
+            # paid for a second render (measured 2026-09-24).
+            floor_env, floor_default = (
+                ("TAP_ZOOM_MAP_ACCEPT", 5.0) if zoom_register == "map" else ("TAP_ZOOM_ACCEPT", 6.0)
+            )
             try:
-                accept = float(os.environ.get("TAP_ZOOM_ACCEPT", "6.0"))
+                accept = float(os.environ.get(floor_env, str(floor_default)))
             except ValueError:
-                accept = 6.0
+                accept = floor_default
             try:
                 detail_accept = float(
                     os.environ.get("TAP_ZOOM_DETAIL_ACCEPT", "6.0")
@@ -873,13 +881,30 @@ async def stream_tap(
                 "TAP_ZOOM_DETAIL", "true"
             )
 
+            # A correct map zoom sits on the judge's 4/5 boundary: one live
+            # render with the right framing scored 4 twice, while the bench
+            # gave the same kind of render 5 on all 18 samples. Take the
+            # median of a few calls there; close-ups keep one.
+            try:
+                samples = max(1, int(os.environ.get("TAP_ZOOM_MAP_SAMPLES", "3")))
+            except ValueError:
+                samples = 3
+            if zoom_register != "map":
+                samples = 1
+
+            async def _step_in(candidate: bytes) -> JudgeResult:
+                runs = await _asyncio.gather(
+                    *(step_in(region_bytes, candidate) for _ in range(samples))
+                )
+                return sorted(runs, key=lambda r: r.score)[len(runs) // 2]
+
             async def _verdicts(
                 img: GeneratedImage,
             ) -> tuple[JudgeResult, JudgeResult | None]:
                 if not detail_on:
-                    return await step_in(region_bytes, img.jpeg_bytes), None
+                    return await _step_in(img.jpeg_bytes), None
                 got = await _asyncio.gather(
-                    step_in(region_bytes, img.jpeg_bytes),
+                    _step_in(img.jpeg_bytes),
                     judge.score_map_legibility(img.jpeg_bytes),
                 )
                 return got[0], got[1]
